@@ -42,7 +42,19 @@ struct NetworkIndicator: View {
 extension View {
     /// Pin the shared `NetworkIndicator` to the navigation bar's trailing edge,
     /// so every screen shows the same connection status (like the desktop header).
+    /// `sharedBackgroundVisibility(.hidden)` drops the nav bar's automatic Liquid
+    /// Glass capsule so the indicator sits plainly on the bar with no box.
     func networkToolbar() -> some View {
-        toolbar { ToolbarItem(placement: .primaryAction) { NetworkIndicator() } }
+        toolbar {
+            if #available(iOS 26.0, *) {
+                // Drop the nav bar's Liquid Glass capsule so the indicator sits
+                // plainly on the bar with no box.
+                ToolbarItem(placement: .primaryAction) { NetworkIndicator() }
+                    .sharedBackgroundVisibility(.hidden)
+            } else {
+                // Pre-26 toolbars don't add a capsule, so plain content is fine.
+                ToolbarItem(placement: .primaryAction) { NetworkIndicator() }
+            }
+        }
     }
 }
