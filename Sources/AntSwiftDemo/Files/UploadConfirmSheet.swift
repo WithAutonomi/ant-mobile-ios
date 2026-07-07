@@ -35,6 +35,18 @@ struct UploadConfirmSheet: View {
             .background(AntColors.blue.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
+            // Background-execution warning. iOS suspends apps that leave the
+            // foreground, and the network transfer runs over QUIC P2P (not a
+            // background-eligible URLSession), so backgrounding fails the upload.
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text("Keep the app open until the upload finishes. Due to iOS limitations, transfers can't continue in the background — leaving the app will fail the upload.")
+                    .font(.caption).foregroundStyle(theme.text)
+            }
+            .padding(10)
+            .background(Color.orange.opacity(0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
             // File row
             HStack {
                 Text(pending.name).font(.subheadline).foregroundStyle(theme.text).lineLimit(1)
