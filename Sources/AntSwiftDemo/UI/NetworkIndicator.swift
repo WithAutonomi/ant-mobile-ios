@@ -8,36 +8,34 @@ struct NetworkIndicator: View {
     @EnvironmentObject private var theme: ThemeController
     @EnvironmentObject private var store: FilesStore
 
+    // The navigation bar already frames toolbar items with their own
+    // (Liquid Glass) background, so this draws NO box of its own — otherwise the
+    // two nest and look like a button inside a button. Connecting/connected are
+    // plain status content; only the failure state is an interactive button.
     var body: some View {
-        switch store.connection {
-        case .idle, .connecting:
-            pill(border: theme.border) {
-                ProgressView().controlSize(.mini)
-                Text("Connecting").foregroundStyle(theme.muted)
-            }
-        case .connected:
-            pill(border: theme.border) {
-                Text("●").foregroundStyle(AntColors.success)
-                Text("Network").foregroundStyle(theme.text)
-            }
-        case .failed:
-            Button { store.retryConnection() } label: {
-                pill(border: AntColors.error.opacity(0.35)) {
-                    Text("●").foregroundStyle(AntColors.error)
-                    Text("Offline · Retry").foregroundStyle(AntColors.error)
+        Group {
+            switch store.connection {
+            case .idle, .connecting:
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.mini)
+                    Text("Connecting").foregroundStyle(theme.muted)
+                }
+            case .connected:
+                HStack(spacing: 5) {
+                    Text("●").foregroundStyle(AntColors.success)
+                    Text("Network").foregroundStyle(theme.text)
+                }
+            case .failed:
+                Button { store.retryConnection() } label: {
+                    HStack(spacing: 5) {
+                        Text("●")
+                        Text("Offline · Retry")
+                    }
+                    .foregroundStyle(AntColors.error)
                 }
             }
-            .buttonStyle(.plain)
         }
-    }
-
-    @ViewBuilder
-    private func pill<Content: View>(border: Color, @ViewBuilder _ content: () -> Content) -> some View {
-        HStack(spacing: 5) { content() }
-            .font(.caption2)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(border, lineWidth: 1))
+        .font(.caption2)
     }
 }
 
