@@ -51,6 +51,40 @@ final class FilesStore: ObservableObject {
     }
     @Published private(set) var network: NetworkInfo = .unknown
 
+    // ── Autonomi network connection status (mirrors the desktop connectionStore:
+    //    idle | connecting | connected | failed) ──
+    enum ConnectionStatus: Equatable {
+        case idle, connecting, connected, failed(String)
+    }
+    @Published private(set) var connection: ConnectionStatus = .idle
+
+    /// Join the Autonomi network (build + start the P2P client from the devnet
+    /// manifest) and track status for the indicator. Idempotent — a no-op while
+    /// already connecting or connected. Called at launch and by the Retry action.
+    func connectNetwork() {
+        switch connection {
+        case .connecting, .connected: return
+        case .idle, .failed: break
+        }
+        connection = .connecting
+        Task {
+            do {
+                _ = try await externalSignerClient()
+                connection = .connected
+            } catch {
+                connection = .failed("\(error)")
+            }
+        }
+    }
+
+    /// Force a fresh connection attempt (drops any cached client first so a
+    /// previously-failed build is retried, not reused).
+    func retryConnection() {
+        esClient = nil
+        connection = .idle
+        connectNetwork()
+    }
+
     private var nextId: Int64 = 1
     private var esClient: Client?
     private var walletClient: Client?

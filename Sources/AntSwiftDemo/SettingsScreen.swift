@@ -53,6 +53,7 @@ struct SettingsScreen: View {
         }
         .antBackground()
         .navigationTitle("Settings")
+        .networkToolbar()
     }
 
     private var settledCount: Int { store.uploads.filter { !$0.status.inProgress }.count }

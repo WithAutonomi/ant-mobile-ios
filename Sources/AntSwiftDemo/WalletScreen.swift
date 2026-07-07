@@ -25,6 +25,7 @@ struct WalletScreen: View {
         }
         .antBackground()
         .navigationTitle("Wallet")
+        .networkToolbar()
         .onAppear { store.refreshNetwork() }
     }
 }

@@ -43,6 +43,7 @@ struct UploadsScreen: View {
         }
         .antBackground()
         .navigationTitle("Uploads")
+        .networkToolbar()
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
             guard case let .success(url) = result else { return }
             guard url.startAccessingSecurityScopedResource() else { return }
@@ -126,6 +127,7 @@ struct DownloadsScreen: View {
         }
         .antBackground()
         .navigationTitle("Downloads")
+        .networkToolbar()
         .fileImporter(isPresented: $pickingDatamap, allowedContentTypes: [.item]) { result in
             guard case let .success(url) = result else { return }
             // Read the datamap hex now, while security-scoped access is valid.
