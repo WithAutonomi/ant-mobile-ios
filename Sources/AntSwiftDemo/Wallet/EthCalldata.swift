@@ -8,6 +8,7 @@ import Foundation
 /// so we don't need a keccak implementation in the demo:
 ///   approve(address,uint256)                                  -> 0x095ea7b3
 ///   payForQuotes((address,uint256,bytes32)[])                 -> 0xb6c2141b
+///   payForMerkleTree(uint8,(bytes32,(address,uint256)[16])[],uint64) -> 0x5460f240
 ///
 /// (Verified with `cast sig`. An earlier value of 0x77a23fd7 was wrong — it
 /// matches no function on the deployed PaymentVault, so calls fell through to
@@ -18,6 +19,14 @@ enum EthCalldata {
     // MARK: Selectors
     static let approveSelector = "095ea7b3"
     static let payForQuotesSelector = "b6c2141b"
+    static let payForMerkleTreeSelector = "5460f240"
+
+    /// keccak256("MerklePaymentMade(bytes32,uint8,uint256,uint64)") — topic0 of
+    /// the event the PaymentVault emits from `payForMerkleTree`. `winnerPoolHash`
+    /// is `indexed`, so it lands in `topics[1]` of the matching receipt log;
+    /// that hash is what `finalize_upload_merkle` needs.
+    static let merklePaymentMadeTopic0 =
+        "0x89f0ad3859fec321e325bcc553fe234bcad374789a86f7ba932067f3f05affec"
 
     /// ERC-20 `approve(spender, amount)`.
     /// `amount` is a base-10 string (atto-token amounts exceed UInt64).
@@ -49,6 +58,53 @@ enum EthCalldata {
             body += word(bytes32: p.quoteHash)
         }
         return "0x" + payForQuotesSelector + body
+    }
+
+    /// One candidate node inside a pool commitment (matches the FFI
+    /// `CandidateNodeEntry`).
+    struct MerkleCandidate {
+        let rewardsAddress: String   // 0x… address
+        let amount: String           // base-10 atto-token amount (node price)
+    }
+
+    /// One pool commitment (matches the FFI `PoolCommitmentEntry`). `candidates`
+    /// must contain exactly `CANDIDATES_PER_POOL` (16) entries.
+    struct PoolCommitment {
+        let poolHash: String              // 0x… 32-byte hash
+        let candidates: [MerkleCandidate] // exactly 16
+    }
+
+    /// PaymentVault `payForMerkleTree(uint8 depth, PoolCommitment[], uint64 ts)`
+    /// where `PoolCommitment = (bytes32 poolHash, (address,uint256)[16] candidates)`.
+    ///
+    /// Encoding note: `PoolCommitment` is a *fully static* tuple — `bytes32`
+    /// (1 word) + a fixed `[16]` array of static `(address,uint256)` (32 words)
+    /// = 33 words, no dynamic parts. So the dynamic `PoolCommitment[]` needs no
+    /// per-element offsets: it's just `length` followed by each element's 33
+    /// words laid out consecutively. The top-level arg head is 3 words
+    /// (depth · offset · ts); the array's data starts at offset 0x60.
+    static func payForMerkleTree(
+        depth: UInt8,
+        poolCommitments: [PoolCommitment],
+        timestamp: UInt64
+    ) -> String {
+        var body = ""
+        body += word(uint256: UInt64(depth))     // head 0: depth (uint8)
+        body += word(uint256: 0x60)              // head 1: offset to array (after 3 head words)
+        body += word(uint256: timestamp)         // head 2: merklePaymentTimestamp
+        body += word(uint256: UInt64(poolCommitments.count)) // array length
+        for pc in poolCommitments {
+            body += word(bytes32: pc.poolHash)
+            precondition(
+                pc.candidates.count == 16,
+                "each pool commitment must have exactly 16 candidates, got \(pc.candidates.count)"
+            )
+            for c in pc.candidates {
+                body += word(address: c.rewardsAddress)
+                body += word(uint256Decimal: c.amount)
+            }
+        }
+        return "0x" + payForMerkleTreeSelector + body
     }
 
     // MARK: - Word encoders (each returns a 64-hex-char / 32-byte word)
