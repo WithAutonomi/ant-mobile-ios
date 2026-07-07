@@ -21,7 +21,31 @@ enum AutonomiChain {
         }
     }
 
+    /// Map a connected wallet's chain id back to a known Autonomi chain, so we
+    /// can read balances from the right RPC / token. Nil for unknown chains.
+    init?(chainId: Int) {
+        switch chainId {
+        case 42161: self = .arbitrumOne
+        case 421614: self = .arbitrumSepolia
+        default: return nil
+        }
+    }
+
     var caip2: String { "eip155:\(chainId)" }
+
+    /// Public JSON-RPC endpoint for read-only balance queries on this chain.
+    var rpcUrl: String {
+        switch self {
+        case .arbitrumOne: return "https://arb1.arbitrum.io/rpc"
+        case .arbitrumSepolia: return "https://sepolia-rollup.arbitrum.io/rpc"
+        }
+    }
+
+    /// Whether the ERC-20 token address is a real (non-zero) deployment — the
+    /// Sepolia address is a per-devnet placeholder, so ANT balance is unknown there.
+    var hasKnownToken: Bool {
+        tokenAddress != "0x0000000000000000000000000000000000000000"
+    }
 
     /// ERC-20 network token ("ANT") address.
     var tokenAddress: String {

@@ -91,6 +91,13 @@ final class WalletConnectManager: ObservableObject {
     @Published var lastTxHash: String?
     @Published var status: String = "Not connected"
 
+    /// Live ANT / ETH balances for the connected wallet on its current chain,
+    /// read directly from that chain's RPC (see `refreshBalances`). Each is nil
+    /// when not connected, the chain is unknown, or the read failed. This is a
+    /// cosmetic read-only view — nothing depends on it for payments.
+    struct Balances: Equatable { var ant: String?; var eth: String? }
+    @Published var balances = Balances()
+
     private var cancellables = Set<AnyCancellable>()
     private var configured = false
 
@@ -206,6 +213,61 @@ final class WalletConnectManager: ObservableObject {
             chainCaip2 = nil
         }
         status = address == nil ? "Not connected" : "Connected"
+        if address != nil { refreshBalances() } else { balances = Balances() }
+    }
+
+    /// Read the connected wallet's ANT + ETH balances from its current chain's
+    /// public RPC (`eth_getBalance` for the gas token, ERC-20 `balanceOf` for
+    /// ANT). Cosmetic and read-only — unknown chains / tokens leave a field nil
+    /// (the UI shows "—"). No effect on the payment flow.
+    func refreshBalances() {
+        guard let address,
+              let idPart = chainCaip2?.split(separator: ":").last,
+              let chainId = Int(idPart),
+              let chain = AutonomiChain(chainId: chainId) else {
+            balances = Balances()
+            return
+        }
+        Task {
+            async let ethHex = Self.rpcResult(rpc: chain.rpcUrl, method: "eth_getBalance",
+                                              params: [address, "latest"])
+            async let antHex: String? = chain.hasKnownToken
+                ? Self.rpcResult(rpc: chain.rpcUrl, method: "eth_call",
+                                 params: [["to": chain.tokenAddress, "data": Self.balanceOfData(address)], "latest"])
+                : nil
+            let eth = (await ethHex).map { Self.formatUnits($0, places: 6) }
+            let ant = (await antHex).map { Self.formatUnits($0, places: 4) }
+            balances = Balances(ant: ant, eth: eth)
+        }
+    }
+
+    /// ERC-20 `balanceOf(address)` calldata (selector 0x70a08231 + padded addr).
+    private static func balanceOfData(_ address: String) -> String {
+        let clean = (address.hasPrefix("0x") ? String(address.dropFirst(2)) : address).lowercased()
+        return "0x70a08231" + String(repeating: "0", count: 24) + clean
+    }
+
+    /// One read-only JSON-RPC call; returns the `result` hex string or nil.
+    private static func rpcResult(rpc: String, method: String, params: [Any]) async -> String? {
+        guard let url = URL(string: rpc) else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        ])
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] as? String else { return nil }
+        return result
+    }
+
+    /// Format a 0x hex quantity as a token amount (÷1e18). Accumulates in Double —
+    /// fine for a display value (we only show a few decimals).
+    private static func formatUnits(_ hex: String, places: Int) -> String {
+        var v = 0.0
+        for c in hex.lowercased() where c.isHexDigit { v = v * 16 + Double(c.hexDigitValue ?? 0) }
+        return String(format: "%.\(places)f", v / 1e18)
     }
 
     /// Send a raw `eth_sendTransaction` (to, calldata) on `chainId` to the

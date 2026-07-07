@@ -60,11 +60,24 @@ private struct WalletContent: View {
             Text(wallet.status).font(.caption).foregroundStyle(theme.muted)
         }
 
-        // Mock balances (as the desktop wallet page shows token holdings).
+        // Live balances for the connected wallet on its current chain (desktop
+        // wallet page shows token holdings). Read-only; "—" when not connected
+        // or the chain/token is unknown.
         AntCard {
-            Text("Balances").font(.subheadline).fontWeight(.medium).foregroundStyle(theme.text)
-            BalanceRow(symbol: "ANT", amount: "715.17361")
-            BalanceRow(symbol: "ETH", amount: "0.01396")
+            HStack {
+                Text("Balances").font(.subheadline).fontWeight(.medium).foregroundStyle(theme.text)
+                Spacer()
+                if wallet.address != nil {
+                    Button { wallet.refreshBalances() } label: {
+                        Image(systemName: "arrow.clockwise").font(.caption)
+                    }.tint(AntColors.blue)
+                }
+            }
+            BalanceRow(symbol: "ANT", amount: wallet.balances.ant ?? "—")
+            BalanceRow(symbol: "ETH", amount: wallet.balances.eth ?? "—")
+            if wallet.address == nil {
+                Text("Connect a wallet to see balances.").font(.caption2).foregroundStyle(theme.muted)
+            }
         }
 
         // Payment test (only when connected).
