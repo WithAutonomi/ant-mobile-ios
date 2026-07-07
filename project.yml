@@ -1,0 +1,76 @@
+name: AntSwiftDemo
+options:
+  bundleIdPrefix: com.autonomi.examples
+  deploymentTarget:
+    iOS: "16.0"
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+# Consume the ant-swift package from the consumer repo it lives in
+# (this examples folder is inside that repo). Use a relative path dep
+# This app lives in its own repo (ant-mobile-ios) and consumes the published
+# ant-swift SDK by version — the release ships the AntFfi xcframework, so no
+# local build is needed. Bump `from:` to adopt a newer SDK release.
+packages:
+  AntSwift:
+    url: https://github.com/WithAutonomi/ant-swift
+    from: 0.0.3
+  # WalletConnect spike (iOS only). Reown AppKit is the successor to
+  # Web3Modal — the same stack the desktop app uses (Reown AppKit + wagmi).
+  # Product/module is `ReownAppKit`. Kept iOS-only because the connect modal
+  # and a transitive dep (CoinbaseWalletSDK) are iOS-oriented; all call sites
+  # are guarded with #if os(iOS).
+  ReownAppKit:
+    url: https://github.com/reown-com/reown-swift
+    majorVersion: 1.0.0
+
+targets:
+  AntSwiftDemo:
+    type: application
+    supportedDestinations: [iOS, macOS]
+    sources: [Sources/AntSwiftDemo]
+    dependencies:
+      - package: AntSwift
+        product: AntFfi
+      # iOS-only: keep this off the macOS build (module name clash + the
+      # package targets iOS). All call sites are guarded with #if os(iOS).
+      - package: ReownAppKit
+        product: ReownAppKit
+        platformFilter: iOS
+      # Needed to call Networking.configure(...) before AppKit.configure (the
+      # SDK requires it). Re-exports WalletConnectRelay → WebSocketFactory.
+      - package: ReownAppKit
+        product: WalletConnectNetworking
+        platformFilter: iOS
+    # Generated Info.plist — needed so we can register the `autonomi://` URL
+    # scheme (CFBundleURLTypes), the mobile analogue of the Android app's
+    # intent filter, for deep links into the Downloads tab.
+    info:
+      path: AntSwiftDemo-Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations~iphone:
+          - UIInterfaceOrientationPortrait
+        # Expose the app's Documents in the Files app so the upload picker has
+        # something to select on a bare Simulator (we seed a sample file there).
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.autonomi.examples.AntSwiftDemo
+            CFBundleURLSchemes:
+              - autonomi
+    settings:
+      base:
+        # WalletConnect keychain/app-group entitlements (iOS). Harmless on macOS.
+        CODE_SIGN_ENTITLEMENTS: AntSwiftDemo.entitlements
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1"
+        # Test/dev only — the demo loads files from /Users/<user>/Library/...
+        # and needs outbound networking. App Sandbox would block both.
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
+        # No team / signing required for local dev runs.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""

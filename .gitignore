@@ -1,0 +1,6 @@
+AntSwiftDemo.xcodeproj/
+.build/
+build/
+DerivedData/
+Package.resolved
+.DS_Store
