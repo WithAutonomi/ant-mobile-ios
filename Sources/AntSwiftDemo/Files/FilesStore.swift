@@ -166,7 +166,16 @@ final class FilesStore: ObservableObject {
                 let c = try await externalSignerClient()
 
                 if info.alreadyStored {
-                    let r = try await c.finalizeUpload(uploadId: info.uploadId, txHashes: [:])
+                    // Finalize must be routed by payment shape even when nothing
+                    // is owed — the FFI rejects a mis-routed finalize. Merkle
+                    // accepts any valid 32-byte winner hash here.
+                    let r: ExternalUploadResult
+                    if info.paymentType == "merkle" {
+                        r = try await c.finalizeUploadMerkle(uploadId: info.uploadId,
+                                                             winnerPoolHash: anyWinnerHash(info))
+                    } else {
+                        r = try await c.finalizeUpload(uploadId: info.uploadId, txHashes: [:])
+                    }
                     completeUpload(id: id, visibility: visibility, address: r.address ?? info.dataMapAddress,
                                    dataMapHex: r.dataMap, cost: "already stored")
                     return
@@ -174,6 +183,15 @@ final class FilesStore: ObservableObject {
 
                 guard let signer = externalSigner else { throw StoreError.badManifest }
                 let evm = try parseManifestEvm()
+
+                // Large uploads settle via a single `payForMerkleTree` call
+                // instead of per-quote `payForQuotes`; the flow differs enough to
+                // live in its own method.
+                if info.paymentType == "merkle" {
+                    try await runMerklePayment(id: id, info: info, visibility: visibility,
+                                               signer: signer, evm: evm, client: c)
+                    return
+                }
 
                 updateUpload(id) { $0.status = .awaitingApproval }
                 let approveTx = try await signer(evm.token,
@@ -209,6 +227,87 @@ final class FilesStore: ObservableObject {
                 updateUpload(id) { $0.status = .failed; $0.error = "\(error)"; $0.stage = nil }
             }
         }
+    }
+
+    /// Merkle payment path: approve → `payForMerkleTree` → read the winning pool
+    /// from the `MerklePaymentMade` event → finalize with that winner hash.
+    /// Unlike the wave path there's a single vault call and the total cost isn't
+    /// known until the contract picks a winner, so we approve a safe upper bound.
+    private func runMerklePayment(id: Int64, info: PreparedUploadInfo, visibility: String,
+                                  signer: (_ to: String, _ data: String, _ chainId: Int) async throws -> String,
+                                  evm: DevnetEvm, client c: Client) async throws {
+        let pools = info.poolCommitments.map { pc in
+            EthCalldata.PoolCommitment(
+                poolHash: pc.poolHash,
+                candidates: pc.candidates.map {
+                    EthCalldata.MerkleCandidate(rewardsAddress: $0.rewardsAddress, amount: $0.amount)
+                }
+            )
+        }
+
+        // The contract charges `median16(winnerPool)·2^depth` and pulls it via
+        // transferFrom, so we must approve at least that. median16 ≤ the largest
+        // candidate amount, so `max(all candidates)·2^depth` is always sufficient
+        // without reimplementing the on-chain winner/median logic.
+        let approveAmount = merkleApproveUpperBound(info)
+
+        updateUpload(id) { $0.status = .awaitingApproval }
+        let approveTx = try await signer(evm.token,
+                                         EthCalldata.approve(spender: evm.vault, amount: approveAmount),
+                                         evm.chainId)
+        try await waitForReceipt(rpc: evm.rpc, txHash: approveTx)
+
+        updateUpload(id) { $0.status = .paying }
+        let payData = EthCalldata.payForMerkleTree(
+            depth: UInt8(info.depth),
+            poolCommitments: pools,
+            timestamp: info.merklePaymentTimestamp
+        )
+        let payTx = try await signer(evm.vault, payData, evm.chainId)
+        try await waitForReceipt(rpc: evm.rpc, txHash: payTx)
+
+        // The winning pool is selected on-chain — recover its hash from the
+        // MerklePaymentMade log; finalize_upload_merkle needs it.
+        guard let receipt = await getReceipt(rpc: evm.rpc, txHash: payTx),
+              let winnerPoolHash = parseWinnerPoolHash(from: receipt) else {
+            throw StoreError.noMerkleEvent
+        }
+
+        updateUpload(id) {
+            $0.status = .uploading
+            $0.stage = "storing"; $0.stageDone = 0; $0.stageTotal = 0
+        }
+        let listener = ProgressBridge { [weak self] u in
+            Task { @MainActor in self?.applyProgress(id: id, u) }
+        }
+        let r = try await c.finalizeUploadMerkleWithProgress(
+            uploadId: info.uploadId, winnerPoolHash: winnerPoolHash, listener: listener)
+        // Gas was paid by the external wallet (not ant-core); read it back from
+        // the approve + payForMerkleTree receipts. The exact ANT cost is what the
+        // vault actually pulled, which we don't reparse — label it "merkle".
+        let gas = await gasSpentEth(rpc: evm.rpc, txHashes: [approveTx, payTx])
+        let cost = "\(r.chunksStored) chunk(s) · merkle"
+            + (gas.map { " · \($0) ETH gas" } ?? "")
+        completeUpload(id: id, visibility: visibility, address: r.address ?? info.dataMapAddress,
+                       dataMapHex: r.dataMap, cost: cost)
+    }
+
+    /// A valid 32-byte winner hash for the already-stored merkle case, where the
+    /// FFI accepts any hash (no payment was made). Prefer a real pool hash.
+    private func anyWinnerHash(_ info: PreparedUploadInfo) -> String {
+        info.poolCommitments.first?.poolHash ?? "0x" + String(repeating: "0", count: 64)
+    }
+
+    /// Pull the indexed `winnerPoolHash` (topics[1]) out of the MerklePaymentMade
+    /// log in a payForMerkleTree receipt. It's already a 0x-prefixed 32-byte hash.
+    private func parseWinnerPoolHash(from receipt: [String: Any]) -> String? {
+        guard let logs = receipt["logs"] as? [[String: Any]] else { return nil }
+        let topic0 = EthCalldata.merklePaymentMadeTopic0.lowercased()
+        for log in logs {
+            guard let topics = log["topics"] as? [String], topics.count >= 2 else { continue }
+            if topics[0].lowercased() == topic0 { return topics[1] }
+        }
+        return nil
     }
 
     private func completeUpload(id: Int64, visibility: String, address: String?, dataMapHex: String, cost: String) {
@@ -341,12 +440,13 @@ final class FilesStore: ObservableObject {
     private struct DevnetEvm { let rpc: String; let token: String; let vault: String; let chainId: Int }
 
     private enum StoreError: LocalizedError {
-        case badManifest, approveReverted, receiptTimeout
+        case badManifest, approveReverted, receiptTimeout, noMerkleEvent
         var errorDescription: String? {
             switch self {
             case .badManifest: return "Could not read devnet manifest EVM section"
             case .approveReverted: return "A payment transaction reverted on-chain"
             case .receiptTimeout: return "Timed out waiting for a transaction to confirm"
+            case .noMerkleEvent: return "payForMerkleTree receipt had no MerklePaymentMade event"
             }
         }
     }
@@ -426,6 +526,49 @@ final class FilesStore: ObservableObject {
     private func updateDownload(_ id: Int64, _ transform: (inout FileEntry) -> Void) {
         if let i = downloads.firstIndex(where: { $0.id == id }) { transform(&downloads[i]) }
     }
+}
+
+/// A safe over-estimate of the merkle payment in atto-tokens:
+/// `max(all candidate amounts across all pools) · 2^depth`. The contract charges
+/// `median16(winnerPool)·2^depth` and median16 ≤ max, so this is always enough
+/// to approve — no need to reimplement the on-chain winner/median selection.
+func merkleApproveUpperBound(_ info: PreparedUploadInfo) -> String {
+    var maxAmt = "0"
+    for pc in info.poolCommitments {
+        for c in pc.candidates where decimalGreater(c.amount, maxAmt) {
+            maxAmt = normalizeDecimal(c.amount)
+        }
+    }
+    return mulDecimalByPowerOfTwo(maxAmt, info.depth)
+}
+
+/// Strip leading zeros from a base-10 integer string (keeps one digit).
+func normalizeDecimal(_ s: String) -> String {
+    let t = s.drop(while: { $0 == "0" })
+    return t.isEmpty ? "0" : String(t)
+}
+
+/// `a > b` for non-negative base-10 integer strings.
+func decimalGreater(_ a: String, _ b: String) -> Bool {
+    let na = normalizeDecimal(a), nb = normalizeDecimal(b)
+    if na.count != nb.count { return na.count > nb.count }
+    return na > nb  // equal length → lexicographic order matches numeric order
+}
+
+/// Multiply a non-negative base-10 integer string by `2^power` (schoolbook
+/// doubling — no BigInt dependency; `power` is a small merkle depth).
+func mulDecimalByPowerOfTwo(_ decimal: String, _ power: UInt32) -> String {
+    var digits = Array(normalizeDecimal(decimal)).map { $0.wholeNumberValue ?? 0 }
+    for _ in 0..<power {
+        var carry = 0
+        for i in stride(from: digits.count - 1, through: 0, by: -1) {
+            let v = digits[i] * 2 + carry
+            digits[i] = v % 10
+            carry = v / 10
+        }
+        if carry > 0 { digits.insert(carry, at: 0) }
+    }
+    return normalizeDecimal(digits.map(String.init).joined())
 }
 
 /// Format an atto-token amount (1e18 = 1 ANT) as a short ANT string.

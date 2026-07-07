@@ -60,6 +60,12 @@ struct UploadConfirmSheet: View {
                         Text("autonomi://\(addr)").font(.system(.caption, design: .monospaced))
                             .foregroundStyle(AntColors.blue).textSelection(.enabled).lineLimit(1)
                     }
+                } else if let info, info.paymentType == "merkle" {
+                    row("Estimated max cost", "\(formatAtto(merkleApproveUpperBound(info))) ANT", accent: true)
+                    row("Merkle tree depth", "\(info.depth)")
+                    row("Gas", "paid at signing")
+                    Text("Large upload — paid in a single merkle-tree transaction. The exact cost is settled on-chain (a winning pool is selected at payment); you approve up to the estimate above.")
+                        .font(.caption).foregroundStyle(theme.muted)
                 } else if let info {
                     row("Network storage cost", "\(formatAtto(info.totalAmount)) ANT", accent: true)
                     row("Chunks to pay for", "\(info.payments.count)")
