@@ -59,6 +59,13 @@ targets:
           - CFBundleURLName: com.autonomi.examples.AntSwiftDemo
             CFBundleURLSchemes:
               - autonomi
+        # Allow cleartext HTTP to LAN hosts — the devnet manifest API + local
+        # Anvil RPC are plain http:// on a private IP. (Sepolia RPC is https.)
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # iOS 14+ prompts before an app touches the local network (manifest
+        # fetch + QUIC node connections). This string is shown in that prompt.
+        NSLocalNetworkUsageDescription: Connect to a local Autonomi devnet on your LAN for testing.
     settings:
       base:
         # WalletConnect keychain/app-group entitlements (iOS). Harmless on macOS.
