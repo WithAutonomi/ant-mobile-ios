@@ -141,12 +141,14 @@ final class WalletConnectManager: ObservableObject {
             socketFactory: SwiftSocketFactory()
         )
 
-        // Propose the Arbitrum chains (One + Sepolia) so the session includes
-        // Sepolia — otherwise AppKit's default proposes mainnet and the wallet
-        // lands on eip155:1, where the devnet's token/vault don't exist.
+        // Propose ONLY the devnet chain (Arbitrum Sepolia). Offering mainnet too
+        // let the wallet negotiate a mainnet-only session and silently sign the
+        // payment on Arbitrum One, while the app polls the Sepolia RPC for the
+        // receipt (→ "timed out waiting for transaction to confirm"). Proposing
+        // just Sepolia forces the session onto the manifest's chain.
         let namespaces: [String: ProposalNamespace] = [
             "eip155": ProposalNamespace(
-                chains: [Blockchain("eip155:421614")!, Blockchain("eip155:42161")!],
+                chains: [Blockchain("eip155:421614")!],
                 methods: ["personal_sign", "eth_signTypedData", "eth_sendTransaction",
                           "wallet_switchEthereumChain", "wallet_addEthereumChain"],
                 events: ["chainChanged", "accountsChanged"]
