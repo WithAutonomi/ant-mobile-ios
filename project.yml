@@ -12,9 +12,11 @@ options:
 # ant-swift SDK by version — the release ships the AntFfi xcframework, so no
 # local build is needed. Bump `from:` to adopt a newer SDK release.
 packages:
+  # LOCAL TEST OVERRIDE (branch test/local-lan-xcframework): consume the local
+  # ant-swift checkout carrying the LAN-devnet client fix. Revert to url/from
+  # for release.
   AntSwift:
-    url: https://github.com/WithAutonomi/ant-swift
-    from: 0.0.3
+    path: ../ant-swift
   # WalletConnect spike (iOS only). Reown AppKit is the successor to
   # Web3Modal — the same stack the desktop app uses (Reown AppKit + wagmi).
   # Product/module is `ReownAppKit`. Kept iOS-only because the connect modal
@@ -59,6 +61,13 @@ targets:
           - CFBundleURLName: com.autonomi.examples.AntSwiftDemo
             CFBundleURLSchemes:
               - autonomi
+        # Allow cleartext HTTP to LAN hosts — the devnet manifest API + local
+        # Anvil RPC are plain http:// on a private IP. (Sepolia RPC is https.)
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # iOS 14+ prompts before an app touches the local network (manifest
+        # fetch + QUIC node connections). This string is shown in that prompt.
+        NSLocalNetworkUsageDescription: Connect to a local Autonomi devnet on your LAN for testing.
     settings:
       base:
         # WalletConnect keychain/app-group entitlements (iOS). Harmless on macOS.

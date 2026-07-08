@@ -29,7 +29,45 @@ struct PendingUpload: Identifiable {
 /// and live progress via the FFI's ProgressListener.
 @MainActor
 final class FilesStore: ObservableObject {
-    let manifestPath = "/Users/nic/Library/Application Support/ant/devnet-manifest.json"
+    /// Where the devnet manifest lives in the app sandbox. It's fetched from a
+    /// devnet host's HTTP API (Developer settings) or — on the simulator with
+    /// no host set — copied from the legacy shared path below.
+    var manifestPath: String {
+        let dir = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("devnet-manifest.json").path
+    }
+
+    /// Simulator convenience: the desktop/CLI writes the manifest here and the
+    /// sim shares the host filesystem. Used only when no devnet host is set.
+    private let legacyManifestPath =
+        "/Users/nic/Library/Application Support/ant/devnet-manifest.json"
+
+    /// Devnet host serving the manifest API, e.g. `192.168.0.62:8088` (set in
+    /// Developer settings). Empty → fall back to the legacy shared path.
+    private var devnetHost: String {
+        (UserDefaults.standard.string(forKey: "devnetHost") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Ensure a manifest file exists at `manifestPath`: fetch it from the devnet
+    /// host's HTTP API when configured (so a physical device needs no file
+    /// copying), else copy the legacy shared file (simulator).
+    func ensureManifest() async {
+        if !devnetHost.isEmpty,
+           let url = URL(string: "http://\(devnetHost)/api/devnet-manifest.json") {
+            do {
+                let (data, resp) = try await URLSession.shared.data(from: url)
+                guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
+                try data.write(to: URL(fileURLWithPath: manifestPath))
+            } catch {
+                // Keep any previously-fetched manifest on a transient failure.
+            }
+        } else if let data = try? Data(contentsOf: URL(fileURLWithPath: legacyManifestPath)) {
+            try? data.write(to: URL(fileURLWithPath: manifestPath))
+        }
+    }
 
     @Published var uploads: [FileEntry] = []
     @Published var downloads: [FileEntry] = []
@@ -68,6 +106,8 @@ final class FilesStore: ObservableObject {
         }
         connection = .connecting
         Task {
+            await ensureManifest()
+            refreshNetwork()
             do {
                 _ = try await externalSignerClient()
                 connection = .connected
