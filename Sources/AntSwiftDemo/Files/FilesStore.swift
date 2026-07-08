@@ -266,8 +266,12 @@ final class FilesStore: ObservableObject {
         pendingUpload = nil
     }
 
-    /// Step 2: the user approved. Sign the payment (approve + payForQuotes on
-    /// the payment chain), then finalize with live storing progress.
+    /// Step 2: the user approved. Ask the SDK for the exact transactions the
+    /// wallet must sign (`approve` + the vault payment call), sign each via the
+    /// external wallet, wait for each receipt, then finalize with live storing
+    /// progress. All ABI encoding, receipt polling, and the merkle-winner lookup
+    /// now live in the SDK (AntFfi `paymentTransactions` / `waitForReceipt` /
+    /// `merkleWinnerPoolHash`) instead of hand-rolled here.
     func approvePending() {
         guard let p = pendingUpload, let info = p.info else { return }
         let id = p.id
@@ -296,43 +300,56 @@ final class FilesStore: ObservableObject {
                 guard let signer = externalSigner else { throw StoreError.badManifest }
                 let evm = try parseManifestEvm()
 
-                // Large uploads settle via a single `payForMerkleTree` call
-                // instead of per-quote `payForQuotes`; the flow differs enough to
-                // live in its own method.
-                if info.paymentType == "merkle" {
-                    try await runMerklePayment(id: id, info: info, visibility: visibility,
-                                               signer: signer, evm: evm, client: c)
-                    return
-                }
-
+                // The SDK builds the exact ordered transactions to sign (approve
+                // + the payment call), including wave batching and the merkle
+                // approve upper-bound. Each `TxRequest` carries its `to`, `data`,
+                // and — for wave `pay` txs — the quote hashes it settles.
                 updateUpload(id) { $0.status = .awaitingApproval }
-                let approveTx = try await signer(evm.token,
-                                                 EthCalldata.approve(spender: evm.vault, amount: info.totalAmount),
-                                                 evm.chainId)
-                try await waitForReceipt(rpc: evm.rpc, txHash: approveTx)
+                let txs = try await c.paymentTransactions(uploadId: info.uploadId)
 
-                updateUpload(id) { $0.status = .paying }
-                let quotePayments = info.payments.map {
-                    EthCalldata.QuotePayment(rewardsAddress: $0.rewardsAddress, amount: $0.amount, quoteHash: $0.quoteHash)
+                var txHashes: [String: String] = [:]  // quoteHash -> txHash (wave finalize)
+                var merklePayTx: String?
+                var merkleVault: String?
+                var gasWei = 0.0
+                for tx in txs {
+                    if tx.kind == "pay" { updateUpload(id) { $0.status = .paying } }
+                    let hash = try await signer(tx.to, tx.data, evm.chainId)
+                    let receipt = try await waitForReceipt(rpcUrl: evm.rpc, txHash: hash, timeoutSecs: 60)
+                    guard receipt.success else { throw StoreError.approveReverted }
+                    gasWei += weiOf(receipt)
+                    if tx.kind == "pay" {
+                        for qh in tx.quoteHashes { txHashes[qh] = hash }
+                        if info.paymentType == "merkle" { merklePayTx = hash; merkleVault = tx.to }
+                    }
                 }
-                let payTx = try await signer(evm.vault, EthCalldata.payForQuotes(quotePayments), evm.chainId)
-                try await waitForReceipt(rpc: evm.rpc, txHash: payTx)
 
+                // Finalize by payment shape.
+                let storeTotal: Int64 = info.paymentType == "merkle" ? 0 : Int64(info.payments.count)
                 updateUpload(id) {
                     $0.status = .uploading
-                    $0.stage = "storing"; $0.stageDone = 0; $0.stageTotal = Int64(info.payments.count)
+                    $0.stage = "storing"; $0.stageDone = 0; $0.stageTotal = storeTotal
                 }
-                var txHashes: [String: String] = [:]
-                for pay in info.payments { txHashes[pay.quoteHash] = payTx }
                 let listener = ProgressBridge { [weak self] u in
                     Task { @MainActor in self?.applyProgress(id: id, u) }
                 }
-                let r = try await c.finalizeUploadWithProgress(uploadId: info.uploadId, txHashes: txHashes, listener: listener)
-                // Gas was paid by the external wallet (not ant-core), so read it
-                // back from the approve + payForQuotes receipts.
-                let gas = await gasSpentEth(rpc: evm.rpc, txHashes: [approveTx, payTx])
-                let cost = "\(r.chunksStored) chunk(s) · \(formatAtto(info.totalAmount)) ANT"
-                    + (gas.map { " · \($0) ETH gas" } ?? "")
+                let r: ExternalUploadResult
+                let costLabel: String
+                if info.paymentType == "merkle" {
+                    guard let payTx = merklePayTx, let vault = merkleVault else { throw StoreError.noMerkleEvent }
+                    // The winning pool is chosen on-chain; the SDK reads it from
+                    // the payForMerkleTree receipt's MerklePaymentMade event.
+                    let winner = try await merkleWinnerPoolHash(rpcUrl: evm.rpc, vaultAddress: vault, txHash: payTx)
+                    r = try await c.finalizeUploadMerkleWithProgress(uploadId: info.uploadId,
+                                                                     winnerPoolHash: winner, listener: listener)
+                    // Exact ANT pulled by the vault isn't reparsed — label "merkle".
+                    costLabel = "\(r.chunksStored) chunk(s) · merkle"
+                } else {
+                    r = try await c.finalizeUploadWithProgress(uploadId: info.uploadId,
+                                                               txHashes: txHashes, listener: listener)
+                    costLabel = "\(r.chunksStored) chunk(s) · \(formatAtto(info.totalAmount)) ANT"
+                }
+                let gas = gasWei > 0 ? String(format: "%.6f", gasWei / 1e18) : nil
+                let cost = costLabel + (gas.map { " · \($0) ETH gas" } ?? "")
                 completeUpload(id: id, visibility: visibility, address: r.address ?? info.dataMapAddress,
                                dataMapHex: r.dataMap, cost: cost)
             } catch {
@@ -341,85 +358,10 @@ final class FilesStore: ObservableObject {
         }
     }
 
-    /// Merkle payment path: approve → `payForMerkleTree` → read the winning pool
-    /// from the `MerklePaymentMade` event → finalize with that winner hash.
-    /// Unlike the wave path there's a single vault call and the total cost isn't
-    /// known until the contract picks a winner, so we approve a safe upper bound.
-    private func runMerklePayment(id: Int64, info: PreparedUploadInfo, visibility: String,
-                                  signer: (_ to: String, _ data: String, _ chainId: Int) async throws -> String,
-                                  evm: DevnetEvm, client c: Client) async throws {
-        let pools = info.poolCommitments.map { pc in
-            EthCalldata.PoolCommitment(
-                poolHash: pc.poolHash,
-                candidates: pc.candidates.map {
-                    EthCalldata.MerkleCandidate(rewardsAddress: $0.rewardsAddress, amount: $0.amount)
-                }
-            )
-        }
-
-        // The contract charges `median16(winnerPool)·2^depth` and pulls it via
-        // transferFrom, so we must approve at least that. median16 ≤ the largest
-        // candidate amount, so `max(all candidates)·2^depth` is always sufficient
-        // without reimplementing the on-chain winner/median logic.
-        let approveAmount = merkleApproveUpperBound(info)
-
-        updateUpload(id) { $0.status = .awaitingApproval }
-        let approveTx = try await signer(evm.token,
-                                         EthCalldata.approve(spender: evm.vault, amount: approveAmount),
-                                         evm.chainId)
-        try await waitForReceipt(rpc: evm.rpc, txHash: approveTx)
-
-        updateUpload(id) { $0.status = .paying }
-        let payData = EthCalldata.payForMerkleTree(
-            depth: UInt8(info.depth),
-            poolCommitments: pools,
-            timestamp: info.merklePaymentTimestamp
-        )
-        let payTx = try await signer(evm.vault, payData, evm.chainId)
-        try await waitForReceipt(rpc: evm.rpc, txHash: payTx)
-
-        // The winning pool is selected on-chain — recover its hash from the
-        // MerklePaymentMade log; finalize_upload_merkle needs it.
-        guard let receipt = await getReceipt(rpc: evm.rpc, txHash: payTx),
-              let winnerPoolHash = parseWinnerPoolHash(from: receipt) else {
-            throw StoreError.noMerkleEvent
-        }
-
-        updateUpload(id) {
-            $0.status = .uploading
-            $0.stage = "storing"; $0.stageDone = 0; $0.stageTotal = 0
-        }
-        let listener = ProgressBridge { [weak self] u in
-            Task { @MainActor in self?.applyProgress(id: id, u) }
-        }
-        let r = try await c.finalizeUploadMerkleWithProgress(
-            uploadId: info.uploadId, winnerPoolHash: winnerPoolHash, listener: listener)
-        // Gas was paid by the external wallet (not ant-core); read it back from
-        // the approve + payForMerkleTree receipts. The exact ANT cost is what the
-        // vault actually pulled, which we don't reparse — label it "merkle".
-        let gas = await gasSpentEth(rpc: evm.rpc, txHashes: [approveTx, payTx])
-        let cost = "\(r.chunksStored) chunk(s) · merkle"
-            + (gas.map { " · \($0) ETH gas" } ?? "")
-        completeUpload(id: id, visibility: visibility, address: r.address ?? info.dataMapAddress,
-                       dataMapHex: r.dataMap, cost: cost)
-    }
-
     /// A valid 32-byte winner hash for the already-stored merkle case, where the
     /// FFI accepts any hash (no payment was made). Prefer a real pool hash.
     private func anyWinnerHash(_ info: PreparedUploadInfo) -> String {
         info.poolCommitments.first?.poolHash ?? "0x" + String(repeating: "0", count: 64)
-    }
-
-    /// Pull the indexed `winnerPoolHash` (topics[1]) out of the MerklePaymentMade
-    /// log in a payForMerkleTree receipt. It's already a 0x-prefixed 32-byte hash.
-    private func parseWinnerPoolHash(from receipt: [String: Any]) -> String? {
-        guard let logs = receipt["logs"] as? [[String: Any]] else { return nil }
-        let topic0 = EthCalldata.merklePaymentMadeTopic0.lowercased()
-        for log in logs {
-            guard let topics = log["topics"] as? [String], topics.count >= 2 else { continue }
-            if topics[0].lowercased() == topic0 { return topics[1] }
-        }
-        return nil
     }
 
     private func completeUpload(id: Int64, visibility: String, address: String?, dataMapHex: String, cost: String) {
@@ -549,85 +491,38 @@ final class FilesStore: ObservableObject {
 
     // MARK: - Manifest / receipts / helpers
 
-    private struct DevnetEvm { let rpc: String; let token: String; let vault: String; let chainId: Int }
+    private struct DevnetEvm { let rpc: String; let chainId: Int }
 
     private enum StoreError: LocalizedError {
-        case badManifest, approveReverted, receiptTimeout, noMerkleEvent
+        case badManifest, approveReverted, noMerkleEvent
         var errorDescription: String? {
             switch self {
             case .badManifest: return "Could not read devnet manifest EVM section"
             case .approveReverted: return "A payment transaction reverted on-chain"
-            case .receiptTimeout: return "Timed out waiting for a transaction to confirm"
-            case .noMerkleEvent: return "payForMerkleTree receipt had no MerklePaymentMade event"
+            case .noMerkleEvent: return "Merkle payment produced no signed transaction"
             }
         }
     }
 
+    /// Read the devnet RPC + chain id from the manifest. Token/vault addresses no
+    /// longer come from here — the SDK's `paymentTransactions` supplies each tx's
+    /// `to`. The chain id is taken from the manifest when present, else defaults
+    /// to Arbitrum Sepolia (the external-signer devnet), replacing the old
+    /// RPC-string guess.
     private func parseManifestEvm() throws -> DevnetEvm {
         let data = try Data(contentsOf: URL(fileURLWithPath: manifestPath))
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let evm = json["evm"] as? [String: Any],
-              let rpc = evm["rpc_url"] as? String,
-              let token = evm["payment_token_address"] as? String,
-              let vault = evm["payment_vault_address"] as? String
+              let rpc = evm["rpc_url"] as? String
         else { throw StoreError.badManifest }
-        let chainId: Int
-        if rpc.range(of: "sepolia", options: .caseInsensitive) != nil { chainId = 421614 }
-        else if rpc.contains("arb1") { chainId = 42161 }
-        else { chainId = 421614 }
-        return DevnetEvm(rpc: rpc, token: token, vault: vault, chainId: chainId)
+        let chainId = (evm["chain_id"] as? Int) ?? 421614
+        return DevnetEvm(rpc: rpc, chainId: chainId)
     }
 
-    private func waitForReceipt(rpc: String, txHash: String, timeout: TimeInterval = 60) async throws {
-        guard let url = URL(string: rpc) else { throw StoreError.badManifest }
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try JSONSerialization.data(withJSONObject: [
-                "jsonrpc": "2.0", "id": 1,
-                "method": "eth_getTransactionReceipt", "params": [txHash],
-            ])
-            if let (data, _) = try? await URLSession.shared.data(for: req),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let result = json["result"] as? [String: Any],
-               let status = result["status"] as? String {
-                if status == "0x1" { return }
-                if status == "0x0" { throw StoreError.approveReverted }
-            }
-            try await Task.sleep(nanoseconds: 1_500_000_000)
-        }
-        throw StoreError.receiptTimeout
-    }
-
-    /// Total gas spent (ETH) across the given tx hashes, read from their
-    /// receipts (`gasUsed × effectiveGasPrice`). Nil if none could be read.
-    private func gasSpentEth(rpc: String, txHashes: [String]) async -> String? {
-        var totalWei: Double = 0
-        for h in txHashes {
-            guard let receipt = await getReceipt(rpc: rpc, txHash: h),
-                  let usedHex = receipt["gasUsed"] as? String,
-                  let priceHex = receipt["effectiveGasPrice"] as? String,
-                  let used = UInt64(usedHex.dropFirst(2), radix: 16),
-                  let price = UInt64(priceHex.dropFirst(2), radix: 16) else { continue }
-            totalWei += Double(used) * Double(price)
-        }
-        guard totalWei > 0 else { return nil }
-        return String(format: "%.6f", totalWei / 1e18)
-    }
-
-    private func getReceipt(rpc: String, txHash: String) async -> [String: Any]? {
-        guard let url = URL(string: rpc) else { return nil }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionReceipt", "params": [txHash],
-        ])
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return json["result"] as? [String: Any]
+    /// Gas spent (wei) for a receipt: `gasUsed × effectiveGasPrice` (decimal
+    /// strings from the SDK's `TxReceipt`). Double is fine — display only.
+    private func weiOf(_ r: TxReceipt) -> Double {
+        (Double(r.gasUsed) ?? 0) * (Double(r.effectiveGasPrice) ?? 0)
     }
 
     private func newId() -> Int64 { defer { nextId += 1 }; return nextId }

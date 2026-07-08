@@ -14,7 +14,7 @@ options:
 packages:
   AntSwift:
     url: https://github.com/WithAutonomi/ant-swift
-    from: 0.0.3
+    from: 0.0.4
   # WalletConnect spike (iOS only). Reown AppKit is the successor to
   # Web3Modal — the same stack the desktop app uses (Reown AppKit + wagmi).
   # Product/module is `ReownAppKit`. Kept iOS-only because the connect modal

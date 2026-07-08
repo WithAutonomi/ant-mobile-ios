@@ -383,15 +383,6 @@ final class WalletConnectManager: ObservableObject {
         return hash
     }
 
-    /// Convenience: ERC-20 `approve(vault, amount)` on the token contract.
-    func sendApprove(chain: AutonomiChain, amount: String = "0") async throws -> String {
-        try await sendTransaction(
-            to: chain.tokenAddress,
-            data: EthCalldata.approve(spender: chain.paymentVaultAddress, amount: amount),
-            chainId: chain.chainId
-        )
-    }
-
     enum SpikeError: LocalizedError {
         case notConnected, badResponse
         case wallet(String)

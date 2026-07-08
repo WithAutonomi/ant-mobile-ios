@@ -79,23 +79,6 @@ private struct WalletContent: View {
                 Text("Connect a wallet to see balances.").font(.caption2).foregroundStyle(theme.muted)
             }
         }
-
-        // Payment test (only when connected).
-        if wallet.address != nil {
-            AntCard {
-                Text("Payment test").font(.subheadline).fontWeight(.medium).foregroundStyle(theme.text)
-                Text("Signs a real payment-vault approve (amount 0 → gas only).")
-                    .font(.caption).foregroundStyle(theme.muted)
-                Button("Send test approve tx (Arbitrum One)") {
-                    Task { _ = try? await wallet.sendApprove(chain: .arbitrumOne, amount: "0") }
-                }
-                .buttonStyle(.borderedProminent)
-                if let hash = wallet.lastTxHash {
-                    Text("tx: \(hash)").font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(theme.text).textSelection(.enabled)
-                }
-            }
-        }
     }
 }
 
