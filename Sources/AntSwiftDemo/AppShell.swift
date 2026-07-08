@@ -52,6 +52,7 @@ struct AppShell: View {
     private func setup() {
         store.refreshNetwork()
         store.connectNetwork()
+        store.startLivenessPoll()
         store.seedSampleDocuments()
         #if os(iOS)
         wallet.configure(projectId: reownProjectId)

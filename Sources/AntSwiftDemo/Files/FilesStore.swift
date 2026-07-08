@@ -117,6 +117,44 @@ final class FilesStore: ObservableObject {
         }
     }
 
+    /// Background liveness: while a devnet host is set, poll its HTTP API so the
+    /// badge reflects reality — flips to `.failed` when the devnet dies, and
+    /// auto-reconnects when it returns (instead of staying green after the
+    /// devnet stops). Started once from the shell. No-op when no host is set.
+    private var livenessStarted = false
+    func startLivenessPoll() {
+        guard !livenessStarted else { return }
+        livenessStarted = true
+        Task {
+            while true {
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                let host = devnetHost
+                guard !host.isEmpty else { continue }
+                let alive = await apiAlive(host)
+                if !alive, connection == .connected {
+                    esClient = nil
+                    walletClient = nil
+                    connection = .failed("devnet unreachable")
+                } else if alive, case .failed = connection {
+                    connectNetwork()
+                }
+            }
+        }
+    }
+
+    /// Cheap reachability check against the devnet's manifest HTTP API.
+    private func apiAlive(_ host: String) async -> Bool {
+        guard let url = URL(string: "http://\(host)/api/info") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            return (resp as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
+        }
+    }
+
     /// Force a fresh connection attempt (drops any cached client first so a
     /// previously-failed build is retried, not reused).
     func retryConnection() {
