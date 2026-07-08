@@ -12,11 +12,9 @@ options:
 # ant-swift SDK by version — the release ships the AntFfi xcframework, so no
 # local build is needed. Bump `from:` to adopt a newer SDK release.
 packages:
-  # LOCAL TEST OVERRIDE (branch test/local-lan-xcframework): consume the local
-  # ant-swift checkout carrying the LAN-devnet client fix. Revert to url/from
-  # for release.
   AntSwift:
-    path: ../ant-swift
+    url: https://github.com/WithAutonomi/ant-swift
+    from: 0.0.3
   # WalletConnect spike (iOS only). Reown AppKit is the successor to
   # Web3Modal — the same stack the desktop app uses (Reown AppKit + wagmi).
   # Product/module is `ReownAppKit`. Kept iOS-only because the connect modal
