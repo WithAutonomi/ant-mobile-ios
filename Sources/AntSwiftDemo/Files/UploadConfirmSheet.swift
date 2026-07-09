@@ -51,7 +51,7 @@ struct UploadConfirmSheet: View {
             HStack {
                 Text(pending.name).font(.subheadline).foregroundStyle(theme.text).lineLimit(1)
                 Spacer()
-                Text(formatSize(Int64(pending.data.count))).font(.caption).foregroundStyle(theme.muted)
+                Text(formatSize(pending.sizeBytes)).font(.caption).foregroundStyle(theme.muted)
             }
 
             // Cost breakdown
@@ -62,6 +62,13 @@ struct UploadConfirmSheet: View {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
                         Text("Obtaining quote from network…").font(.subheadline).foregroundStyle(theme.muted)
+                    }
+                    // Show the fast sampled estimate (if it landed) while the full
+                    // quote is still running, so the user sees a ballpark up front.
+                    if let est = pending.estimate {
+                        row("Estimated cost", estimateLabel(est), accent: true)
+                        Text("Quick estimate from a sample of the file — the exact cost fills in above once quoting finishes.")
+                            .font(.caption2).foregroundStyle(theme.muted)
                     }
                 } else if let info, info.alreadyStored {
                     Label("Already stored on the network — free", systemImage: "checkmark.seal")
@@ -138,6 +145,16 @@ struct UploadConfirmSheet: View {
             store.completeAlreadyStored()
         } else {
             store.approvePending()
+        }
+    }
+
+    /// Render a `CostEstimate` honoring its confidence — never present a
+    /// best-effort "0" as a firm free price.
+    private func estimateLabel(_ est: CostEstimate) -> String {
+        switch est.confidence {
+        case "verified_all_already_stored": return "already stored — free"
+        case "all_samples_already_stored_incomplete": return "likely already stored"
+        default: return "~\(formatAtto(est.storageCostAtto)) ANT"
         }
     }
 

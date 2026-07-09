@@ -16,9 +16,14 @@ private final class ProgressBridge: ProgressListener, @unchecked Sendable {
 struct PendingUpload: Identifiable {
     let id: Int64          // the FileEntry row id
     let name: String
-    let data: Data
+    /// Path to the picked file copied into the app sandbox. The upload streams
+    /// from disk (file-path FFI) instead of holding the whole file in memory.
+    let path: String
+    let sizeBytes: Int64
     var visibility: String // "private" | "public"
     var info: PreparedUploadInfo?  // nil while (re)quoting
+    /// Fast sampled cost estimate shown while the full quote is still running.
+    var estimate: CostEstimate?
     var quoting: Bool
     var error: String?
 }
@@ -203,22 +208,26 @@ final class FilesStore: ObservableObject {
     /// sheet (`pendingUpload`); the user reviews cost then Approves or Cancels.
     /// With no wallet connected there's nothing to sign, so we fall back to the
     /// devnet single-shot put immediately.
-    func stageUpload(name: String, data: Data) {
+    func stageUpload(name: String, path: String) {
         let id = newId()
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let sizeBytes = (attrs?[.size] as? Int64) ?? 0
         uploads.insert(FileEntry(id: id, kind: .upload, name: name,
-                                 sizeBytes: Int64(data.count), status: .quoting,
+                                 sizeBytes: sizeBytes, status: .quoting,
                                  createdAt: Date()), at: 0)
         guard walletAddress() != nil, externalSigner != nil else {
-            Task { await devnetUpload(id: id, data: data) }
+            Task { await devnetUpload(id: id, path: path) }
             return
         }
-        pendingUpload = PendingUpload(id: id, name: name, data: data,
-                                      visibility: "private", info: nil, quoting: true, error: nil)
+        pendingUpload = PendingUpload(id: id, name: name, path: path, sizeBytes: sizeBytes,
+                                      visibility: "private", info: nil, estimate: nil,
+                                      quoting: true, error: nil)
         quote(id: id)
     }
 
     /// Flip the pending upload's visibility and re-quote (public pays for one
-    /// extra chunk — the published data map — so the estimate differs).
+    /// extra chunk — the published data map — so the estimate differs). The
+    /// sampled cost estimate is visibility-independent, so it's kept.
     func setPendingVisibility(_ vis: String) {
         guard var p = pendingUpload, p.visibility != vis else { return }
         p.visibility = vis; p.info = nil; p.quoting = true; p.error = nil
@@ -228,11 +237,22 @@ final class FilesStore: ObservableObject {
 
     private func quote(id: Int64) {
         guard let pending = pendingUpload, pending.id == id else { return }
+        let path = pending.path
         updateUpload(id) { $0.status = .quoting }
         Task {
             do {
                 let c = try await externalSignerClient()
-                let info = try await c.prepareDataUpload(data: pending.data, visibility: pending.visibility)
+                // Fast sampled estimate first, so the sheet shows a ballpark cost
+                // immediately instead of a bare spinner while the full quote runs.
+                // Only fetch it once — it doesn't depend on visibility.
+                if pendingUpload?.id == id, pendingUpload?.estimate == nil {
+                    if let est = try? await c.estimateFileCost(path: path, paymentMode: "auto"),
+                       var p = pendingUpload, p.id == id {
+                        p.estimate = est
+                        pendingUpload = p
+                    }
+                }
+                let info = try await c.prepareFileUpload(path: path, visibility: pending.visibility)
                 guard var p = pendingUpload, p.id == id else { return } // dismissed meanwhile
                 p.info = info; p.quoting = false
                 pendingUpload = p
@@ -252,6 +272,7 @@ final class FilesStore: ObservableObject {
     func completeAlreadyStored() {
         guard let p = pendingUpload, let info = p.info, let addr = info.dataMapAddress else { return }
         let id = p.id
+        cleanupTemp(p.path)
         pendingUpload = nil
         updateUpload(id) {
             $0.status = .complete; $0.stage = nil
@@ -262,8 +283,19 @@ final class FilesStore: ObservableObject {
 
     /// Cancel the pending upload (dismiss the sheet, drop the row).
     func cancelPending() {
-        if let id = pendingUpload?.id { uploads.removeAll { $0.id == id } }
+        if let p = pendingUpload {
+            uploads.removeAll { $0.id == p.id }
+            cleanupTemp(p.path)
+        }
         pendingUpload = nil
+    }
+
+    /// Remove a staged upload's sandbox copy once it's no longer needed
+    /// (completed, cancelled, or failed). Best-effort — the temp dir is
+    /// OS-reclaimed anyway.
+    private func cleanupTemp(_ path: String?) {
+        guard let path else { return }
+        try? FileManager.default.removeItem(atPath: path)
     }
 
     /// Step 2: the user approved. Ask the SDK for the exact transactions the
@@ -276,8 +308,10 @@ final class FilesStore: ObservableObject {
         guard let p = pendingUpload, let info = p.info else { return }
         let id = p.id
         let visibility = p.visibility
+        let tmpPath = p.path
         pendingUpload = nil
         Task {
+            defer { cleanupTemp(tmpPath) }
             do {
                 let c = try await externalSignerClient()
 
@@ -386,14 +420,16 @@ final class FilesStore: ObservableObject {
     }
 
     /// Devnet fallback: the manifest wallet pays inside ant-core (single-shot).
-    private func devnetUpload(id: Int64, data: Data) async {
+    /// Uploads from the sandbox file path (streams from disk).
+    private func devnetUpload(id: Int64, path: String) async {
+        defer { cleanupTemp(path) }
         do {
             let c = try await devnetClient()
             updateUpload(id) { $0.status = .uploading }
-            let r = try await c.dataPutPublic(data: data, paymentMode: "auto")
+            let r = try await c.fileUploadPublic(path: path, paymentMode: "auto")
             updateUpload(id) {
                 $0.status = .complete; $0.address = r.address
-                $0.cost = "\(r.chunksStored) chunk(s) · \(r.paymentModeUsed)"
+                $0.cost = "uploaded"
             }
         } catch {
             updateUpload(id) { $0.status = .failed; $0.error = "\(error)" }
