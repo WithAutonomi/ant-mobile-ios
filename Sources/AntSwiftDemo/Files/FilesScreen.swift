@@ -48,9 +48,16 @@ struct UploadsScreen: View {
             guard case let .success(url) = result else { return }
             guard url.startAccessingSecurityScopedResource() else { return }
             defer { url.stopAccessingSecurityScopedResource() }
-            if let data = try? Data(contentsOf: url) {
-                store.stageUpload(name: url.lastPathComponent, data: data)
-            }
+            // Copy into the app sandbox so the path outlives the security-scoped
+            // access and the upload can stream from disk (file-path FFI) instead
+            // of loading the whole file into memory.
+            let name = url.lastPathComponent
+            let dest = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + "-" + name)
+            do {
+                try FileManager.default.copyItem(at: url, to: dest)
+                store.stageUpload(name: name, path: dest.path)
+            } catch { return }
         }
         .sheet(item: Binding(
             get: { store.pendingUpload },
