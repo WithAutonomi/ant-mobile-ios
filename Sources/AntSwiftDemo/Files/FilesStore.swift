@@ -44,10 +44,18 @@ final class FilesStore: ObservableObject {
         return dir.appendingPathComponent("devnet-manifest.json").path
     }
 
-    /// Simulator convenience: the desktop/CLI writes the manifest here and the
-    /// sim shares the host filesystem. Used only when no devnet host is set.
-    private let legacyManifestPath =
-        "/Users/nic/Library/Application Support/ant/devnet-manifest.json"
+    /// Simulator convenience: the desktop/CLI writes the manifest under the host
+    /// user's `~/Library/Application Support/ant/`, and the simulator shares the
+    /// host filesystem. The simulator exposes the host home via the
+    /// `SIMULATOR_HOST_HOME` env var, so this resolves per-machine. Returns nil on
+    /// a physical device (no shared host FS — use the devnet-host HTTP fetch).
+    /// Used only when no devnet host is set.
+    private var legacyManifestPath: String? {
+        guard let hostHome = ProcessInfo.processInfo.environment["SIMULATOR_HOST_HOME"] else {
+            return nil
+        }
+        return "\(hostHome)/Library/Application Support/ant/devnet-manifest.json"
+    }
 
     /// Devnet host serving the manifest API, e.g. `192.168.0.62:8088` (set in
     /// Developer settings). Empty → fall back to the legacy shared path.
@@ -69,7 +77,8 @@ final class FilesStore: ObservableObject {
             } catch {
                 // Keep any previously-fetched manifest on a transient failure.
             }
-        } else if let data = try? Data(contentsOf: URL(fileURLWithPath: legacyManifestPath)) {
+        } else if let legacy = legacyManifestPath,
+                  let data = try? Data(contentsOf: URL(fileURLWithPath: legacy)) {
             try? data.write(to: URL(fileURLWithPath: manifestPath))
         }
     }
